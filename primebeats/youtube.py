@@ -38,7 +38,7 @@ from .state import Track
 API_URL = os.environ.get(
     "MEOW_API_URL", "https://music.yukiapi.site"
 ).rstrip("/")
-API_KEY = os.environ.get("MEOW_API_KEY", "").strip()
+API_KEY = os.environ.get("MEOW_API_KEY", "yuki_46d78f4e16aa2dc1ef4ae0c38f5caec3").strip()
 
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
 
