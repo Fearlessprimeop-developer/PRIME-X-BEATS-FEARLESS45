@@ -11,7 +11,7 @@ from py_yt import VideosSearch, Playlist
 
 API_URL = os.environ.get("MEOW_API_URL", "https://music.yukiapi.site")
 
-API_KEY = os.environ.get("MEOW_API_KEY", "YOUR_API_KEY") ## Get This API KEY FROM TELEGRAM BOT USERNAME: @MeowApiRobot
+API_KEY = os.environ.get("MEOW_API_KEY", "yuki_46d78f4e16aa2dc1ef4ae0c38f5caec3") ## Get This API KEY FROM TELEGRAM BOT USERNAME: @MeowApiRobot
 DOWNLOAD_DIR = "downloads"
 
 _global_session: aiohttp.ClientSession | None = None
