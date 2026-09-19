@@ -124,90 +124,23 @@ class PrimeBeats:
             return f'<a href="tg://user?id={uid}">{name.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")}</a>'
         return name
 
-    def _make_media(self, track, video: bool, effect: str = "normal",
-                    speed: float = 1.0, start_at: float = 0.0):
-        """Build a stable MediaStream from an already-prepared local source.
-
-        FX/speed/seek are rendered by _prepare_variant before PyTgCalls sees
-        the file. This avoids dynamic FFmpeg arguments inside MediaStream,
-        which is the path associated with the reported NoneType.write failure.
-        """
-        source=str(getattr(track, "stream_url", "") or "").strip()
-        if not source:
-            raise RuntimeError("Empty media source.")
+    def _make_media(self, track, video: bool, effect: str, speed: float = 1.0, start_at: float = 0.0):
+        # Keep the same source when changing effects/seek. PyTgCalls'
+        # MediaStream accepts a real audio+video source and keeps the existing
+        # group call connected while change_stream swaps the media pipeline.
+        ff = self._audio_filter(effect, speed)
+        # Keep FFmpeg parameters simple. Combining -ss with -af in the generic
+        # PyTgCalls parameter slot can produce a silent replacement stream on
+        # some ntgcalls/PyTgCalls builds. Seeking is tracked in player state.
+        kwargs = {}
+        if ff:
+            kwargs["ffmpeg_parameters"] = f"-af {ff}"
         if video:
-            return MediaStream(source, AudioQuality.HIGH, VideoQuality.SD_480p)
-        return MediaStream(
-            source,
-            AudioQuality.HIGH,
-            video_flags=MediaStream.Flags.IGNORE,
-        )
-
-    async def _prepare_variant(self, track, position: float, effect: str, speed: float) -> str:
-        """Render seek/effect/speed into a temporary local media file."""
-        source=str(
-            getattr(track, "_base_stream_url", None)
-            or getattr(track, "stream_url", "")
-            or ""
-        ).strip()
-        if not source:
-            raise RuntimeError("Current media source is empty.")
-
-        ff_source=source if source.startswith(("http://","https://")) else os.path.abspath(source)
-        if not ff_source.startswith(("http://","https://")):
-            if not os.path.isfile(ff_source):
-                raise FileNotFoundError(ff_source)
-
-        position=max(0.0,float(position))
-        filt=self._audio_filter(effect,float(speed))
-
-        if position <= 0.05 and not filt:
-            return ff_source
-
-        out_dir=pathlib.Path("/tmp/primebeats_variants")
-        out_dir.mkdir(parents=True,exist_ok=True)
-        suffix=".mp4" if bool(getattr(track,"video",False)) else ".m4a"
-        fd,out_path=tempfile.mkstemp(prefix="variant_",suffix=suffix,dir=str(out_dir))
-        os.close(fd)
-
-        if bool(getattr(track,"video",False)):
-            cmd=[
-                "ffmpeg","-hide_banner","-loglevel","error","-y",
-                "-ss",f"{position:.3f}","-i",ff_source,
-                "-map","0:v:0?","-map","0:a:0?",
-                "-c:v","copy","-c:a","aac","-b:a","192k",
-            ]
-            if filt:
-                cmd += ["-af",filt]
-            cmd += ["-movflags","+faststart",out_path]
-        else:
-            cmd=[
-                "ffmpeg","-hide_banner","-loglevel","error","-y",
-                "-ss",f"{position:.3f}","-i",ff_source,
-                "-vn","-c:a","aac","-b:a","192k",
-            ]
-            if filt:
-                cmd += ["-af",filt]
-            cmd += ["-movflags","+faststart",out_path]
-
-        try:
-            proc=await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _,err=await asyncio.wait_for(proc.communicate(),timeout=90)
-            if proc.returncode != 0:
-                raise RuntimeError(
-                    err.decode("utf-8","ignore")[-1500:] or
-                    "FFmpeg variant creation failed"
-                )
-            if not os.path.isfile(out_path) or os.path.getsize(out_path)<=10000:
-                raise RuntimeError("FFmpeg produced an invalid media variant.")
-            return out_path
-        except Exception:
-            _cleanup_variant(out_path)
-            raise
+            # Telegram/PyTgCalls' documented video profile supports HD 720p.
+            # Do NOT set IGNORE here: that flag is specifically for audio-only.
+            return MediaStream(track.stream_url, AudioQuality.HIGH, VideoQuality.SD_480p, **kwargs)
+        kwargs["video_flags"] = MediaStream.Flags.IGNORE
+        return MediaStream(track.stream_url, AudioQuality.HIGH, **kwargs)
 
     @staticmethod
     def _atempo_chain(value: float) -> str:
@@ -295,70 +228,59 @@ class PrimeBeats:
             await asyncio.wait_for(maybe(self.calls.leave_call(chat_id)), timeout=5)
 
     async def stream(self,chat_id,track,video=False,effect=None,start_at:float=0.0,refresh=False):
-        """Start/replace media without leaving the existing Voice Chat."""
+        """Start one media stream with explicit diagnostics and safe state rollback."""
         p=self.store.get(chat_id)
         old_state=(p.current,p.paused,p.muted,p.video,p.effect,p.started_at)
         fresh=track
-        base_source=""
 
         try:
             if refresh or not getattr(track,"stream_url",None):
+                log.info("stream: resolving source chat=%s title=%r",chat_id,getattr(track,"title",""))
                 fresh=await asyncio.wait_for(
                     resolve(track.webpage_url,track.requested_by,video),
-                    timeout=60
+                    timeout=35
                 )
 
-            source=str(getattr(fresh,"stream_url","") or "").strip()
-            if not source:
-                raise RuntimeError("Resolver returned no media source.")
+            if not getattr(fresh,"stream_url",None):
+                raise RuntimeError("YouTube resolver returned no direct media URL.")
 
-            if source.startswith(("http://","https://")):
-                base_source=source
+            source = str(fresh.stream_url).strip()
+            if source.startswith(("http://", "https://")):
+                pass
             else:
-                base_source=os.path.abspath(source)
-                if not os.path.isfile(base_source) or os.path.getsize(base_source)<=10000:
-                    raise RuntimeError(f"Invalid media source: {source}")
-
-            fresh.video=bool(video)
-            fresh._base_stream_url=base_source
+                # Yuki returns a local media path. Normalize it before passing
+                # it to PyTgCalls so relative paths are accepted safely.
+                source = os.path.abspath(source)
+                if not os.path.isfile(source) or os.path.getsize(source) <= 10000:
+                    raise RuntimeError(
+                        f"Invalid media source returned by resolver: {fresh.stream_url}"
+                    )
+                fresh.stream_url = source
 
             await self._ensure_voice_chat(chat_id)
 
             effect_key=effect or getattr(p,"effect","normal")
             speed=float(getattr(p,"speed",1.0))
+            fresh.stream_url = fresh.stream_url or track.stream_url
+            media=self._make_media(fresh,video,effect_key,speed,start_at)
 
-            if (
-                abs(float(start_at))>0.05
-                or effect_key!="normal"
-                or abs(speed-1.0)>0.0005
-            ):
-                prepared=await self._prepare_variant(
-                    fresh,float(start_at),effect_key,speed
-                )
+            # If a track is already active, replace only its media stream. This
+            # keeps the same Telegram VC alive and is also the stable path used
+            # by FX/seek. For a brand-new track/session, play() starts the stream.
+            change=getattr(self.calls,"change_stream",None)
+            use_change=bool(p.current is not None and change is not None)
+            if use_change:
+                log.info("stream: change_stream chat=%s video=%s effect=%s",chat_id,bool(video),effect_key)
+                try:
+                    result=await asyncio.wait_for(maybe(change(chat_id,media)),timeout=35)
+                except Exception:
+                    log.exception("stream: change_stream failed; falling back to play chat=%s",chat_id)
+                    result=await asyncio.wait_for(maybe(self.calls.play(chat_id,media)),timeout=35)
             else:
-                prepared=base_source
-
-            fresh.stream_url=prepared
-            media=self._make_media(
-                fresh,video,effect_key,speed,float(start_at)
-            )
-
-            try:
-                # py-tgcalls 2.3.3 updates the media source of an existing
-                # group call when play() is called again.
-                await asyncio.wait_for(
-                    maybe(self.calls.play(chat_id,media)),timeout=45
-                )
-            except Exception as play_exc:
-                change=getattr(self.calls,"change_stream",None)
-                if change is None:
-                    raise
-                log.warning("play() failed, trying change_stream: %s",play_exc)
-                await asyncio.wait_for(
-                    maybe(change(chat_id,media)),timeout=45
-                )
-
-            await asyncio.sleep(0.45)
+                log.info("stream: play chat=%s video=%s effect=%s",chat_id,bool(video),effect_key)
+                result=await asyncio.wait_for(maybe(self.calls.play(chat_id,media)),timeout=35)
+            log.info("stream: media call returned chat=%s result=%r",chat_id,result)
+            await asyncio.sleep(0.40)
             resume=getattr(self.calls,"resume_stream",None)
             if resume is not None:
                 with suppress(Exception):
@@ -366,18 +288,23 @@ class PrimeBeats:
             with suppress(Exception):
                 await maybe(self.calls.change_volume_call(chat_id,p.volume))
 
+        except asyncio.TimeoutError as exc:
+            p.current,p.paused,p.muted,p.video,p.effect,p.started_at=old_state
+            log.exception("STREAM TIMEOUT chat=%s",chat_id)
+            raise RuntimeError(
+                "Voice-chat stream timed out after 35 seconds. "
+                "The assistant/VC engine did not accept the media."
+            ) from exc
         except Exception:
             p.current,p.paused,p.muted,p.video,p.effect,p.started_at=old_state
             log.exception("STREAM START FAILED chat=%s",chat_id)
             raise
 
-        track._base_stream_url=base_source
         track.stream_url=fresh.stream_url
-        track.title=getattr(fresh,"title",track.title)
-        track.duration=getattr(fresh,"duration",track.duration)
-        track.thumbnail=getattr(fresh,"thumbnail",track.thumbnail)
+        track.title=fresh.title
+        track.duration=fresh.duration
+        track.thumbnail=fresh.thumbnail
         track.video=bool(video)
-
         p.current=track
         p.paused=False
         p.muted=False
@@ -385,81 +312,78 @@ class PrimeBeats:
         p.effect=effect_key
         p.started_at=time.monotonic()-max(0.0,float(start_at))
         self._arm_end_watchdog(chat_id,track)
-        return True
 
     async def _restart_current(self,chat_id,position:float|None=None):
-        """Seek/apply FX using a prepared local variant, without leaving VC."""
+        """Apply FX/seek without leaving the existing Voice Chat."""
         p=self.store.get(chat_id)
         if not p.current:
             return False
-
         target=p.current
         video=bool(getattr(target,"video",p.video))
-        pos=max(0.0,0.0 if position is None else float(position))
+        pos=0.0 if position is None else max(0.0,float(position))
         if target.duration:
-            pos=min(pos,max(0.0,float(target.duration)-0.5))
-
+            pos=min(pos,max(0.0,target.duration-0.5))
         self._cancel_end_watchdog(chat_id)
 
-        base=str(getattr(target,"_base_stream_url",None) or target.stream_url or "")
-        if not base:
-            raise RuntimeError("Current media source is empty.")
-        target._base_stream_url=base
+        # Always reuse the already-resolved/local source. Re-resolving on every
+        # effect click can produce a new/expired provider URL and is a common
+        # reason the VC stays connected while playback becomes silent.
+        source=target.stream_url
+        if not source:
+            fresh=await asyncio.wait_for(resolve(target.webpage_url,target.requested_by,video),timeout=35)
+            source=fresh.stream_url
+            target.stream_url=source
+            target.title=fresh.title; target.duration=fresh.duration; target.thumbnail=fresh.thumbnail
 
-        variant=await self._prepare_variant(
-            target,pos,getattr(p,"effect","normal"),
-            float(getattr(p,"speed",1.0))
-        )
-        old_stream=str(getattr(target,"stream_url","") or "")
-        target.stream_url=variant
-        target.video=video
-        media=self._make_media(
-            target,video,getattr(p,"effect","normal"),
-            float(getattr(p,"speed",1.0)),pos
-        )
+        # Normalize local Yuki/yt-dlp files before MediaStream receives them.
+        if not str(source).startswith(("http://","https://")):
+            source=os.path.abspath(str(source))
+            if not os.path.isfile(source) or os.path.getsize(source) <= 10000:
+                raise RuntimeError(f"Current media source is missing: {source}")
+            target.stream_url=source
 
-        try:
-            # IMPORTANT: play() is primary for py-tgcalls 2.3.3. It replaces
-            # the source in the existing call instead of leaving the VC.
-            await asyncio.wait_for(
-                maybe(self.calls.play(chat_id,media)),timeout=45
-            )
-        except Exception as play_exc:
-            change=getattr(self.calls,"change_stream",None)
-            if change is None:
-                target.stream_url=old_stream or base
-                _cleanup_variant(variant)
-                self._arm_end_watchdog(chat_id,target)
-                raise
-            log.warning("FX/seek play() failed; trying change_stream: %s",play_exc)
+        media=self._make_media(target,video,p.effect,float(getattr(p,"speed",1.0)),pos)
+        change=getattr(self.calls,"change_stream",None)
+        last=None
+
+        # change_stream is the important path for an active stream: PyTgCalls
+        # documents it as replacing the media without reconnecting the call.
+        if change is not None:
             try:
-                await asyncio.wait_for(
-                    maybe(change(chat_id,media)),timeout=45
-                )
-            except Exception:
-                target.stream_url=old_stream or base
-                _cleanup_variant(variant)
+                await asyncio.wait_for(maybe(change(chat_id,media)),timeout=35)
+                await asyncio.sleep(0.40)
+                resume=getattr(self.calls,"resume_stream",None)
+                if resume is not None:
+                    with suppress(Exception):
+                        await asyncio.wait_for(maybe(resume(chat_id)),timeout=8)
+                p.paused=False
+                p.started_at=time.monotonic()-pos
                 self._arm_end_watchdog(chat_id,target)
-                raise
+                log.info("FX/seek change_stream succeeded chat=%s effect=%s",chat_id,p.effect)
+                return True
+            except Exception as exc:
+                last=exc
+                log.warning("change_stream failed chat=%s: %s",chat_id,exc)
 
-        await asyncio.sleep(0.45)
-        resume=getattr(self.calls,"resume_stream",None)
-        if resume is not None:
-            with suppress(Exception):
-                await asyncio.wait_for(maybe(resume(chat_id)),timeout=8)
-        with suppress(Exception):
-            await maybe(self.calls.change_volume_call(chat_id,p.volume))
-
-        p.paused=False
-        p.started_at=time.monotonic()-pos
-        self._arm_end_watchdog(chat_id,target)
-
-        if old_stream.startswith("/tmp/primebeats_variants/") and old_stream!=variant:
-            _cleanup_variant(old_stream)
-
-        log.info("FX/SEEK applied chat=%s position=%.2f effect=%s",
-                 chat_id,pos,getattr(p,"effect","normal"))
-        return True
+        # Fallback only when there is no active stream/change_stream failed.
+        # Do not leave the VC; play() can reuse the existing call.
+        play=getattr(self.calls,"play",None)
+        if play is not None:
+            try:
+                await asyncio.wait_for(maybe(play(chat_id,media)),timeout=35)
+                await asyncio.sleep(0.40)
+                resume=getattr(self.calls,"resume_stream",None)
+                if resume is not None:
+                    with suppress(Exception):
+                        await asyncio.wait_for(maybe(resume(chat_id)),timeout=8)
+                p.paused=False
+                p.started_at=time.monotonic()-pos
+                self._arm_end_watchdog(chat_id,target)
+                log.info("FX/seek play fallback succeeded chat=%s effect=%s",chat_id,p.effect)
+                return True
+            except Exception as exc:
+                last=exc
+        raise RuntimeError(f"Stream replacement failed: {last}")
 
     async def _autofill(self, chat_id, minimum=8):
         p=self.store.get(chat_id)
@@ -776,46 +700,30 @@ class PrimeBeats:
         root=os.path.dirname(__file__)
 
         def asset(name, env_name):
-            configured=os.environ.get(env_name,"").strip()
+            # Accept both the normal deployed assets/ folder and the uploaded
+            # assets_FEARLESS/ folder so image/video messages do not silently
+            # fall back to text when the folder name differs.
+            configured=os.environ.get(env_name)
             if configured and os.path.isfile(configured):
                 return configured
-
-            roots=[
-                pathlib.Path(root),
-                pathlib.Path(root).parent,
-                pathlib.Path.cwd(),
-                pathlib.Path("/opt/render/project/src"),
-                pathlib.Path("/app"),
-            ]
-            candidates=[]
-            for base in roots:
-                for folder in ("assets","assets_FEARLESS"):
-                    candidates.append(base/folder/name)
-
+            media_dir=os.environ.get("MEDIA_DIR", "").strip()
+            candidates=tuple(x for x in (
+                os.path.join(media_dir, name) if media_dir else None,
+                os.path.join(root, "assets", name),
+                os.path.join(root, "assets_FEARLESS", name),
+                os.path.join(os.path.dirname(root), "assets", name),
+                os.path.join(os.path.dirname(root), "assets_FEARLESS", name),
+                os.path.join(os.getcwd(), "assets", name),
+                os.path.join(os.getcwd(), "assets_FEARLESS", name),
+                os.path.join("/app", "assets", name),
+                os.path.join("/app", "assets_FEARLESS", name),
+                os.path.join("/mnt/data", "assets_FEARLESS", name),
+            ) if x)
             for candidate in candidates:
-                try:
-                    if candidate.is_file() and candidate.stat().st_size>0:
-                        return str(candidate)
-                except OSError:
-                    pass
-
-            # The repository shown by the user contains /assets. If the bot
-            # module is packaged below that directory, locate the same filename
-            # recursively rather than silently falling back to text.
-            for base in roots:
-                try:
-                    if not base.exists() or not base.is_dir():
-                        continue
-                    for candidate in base.rglob(name):
-                        if candidate.is_file() and candidate.stat().st_size>0:
-                            log.info("MEDIA ASSET FOUND %s -> %s",name,candidate)
-                            return str(candidate)
-                except (OSError,PermissionError):
-                    continue
-
-            log.error("MEDIA ASSET MISSING: %s",name)
-            return str(candidates[0]) if candidates else name
-
+                if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                    return candidate
+            log.error("MEDIA ASSET MISSING: %s; checked=%s", name, candidates)
+            return candidates[0]
 
         async def send_help_message(chat_id):
             image=asset("fearless_help.png", "HELP_IMAGE_PATH")
@@ -989,11 +897,15 @@ class PrimeBeats:
                 return
             if not arg:await m.reply_text("♾️ <b>Usage:</b> <code>/autoplay Romantic Hindi Songs</code>");return
             p.autoplay=True;p.autoplay_topic=arg[:120];p.autoplay_round=0;p.autoplay_seen.clear()
+            # Start/attach the VC before discovery playback so autoplay never
+            # leaves a silent player card while the call itself is idle.
+            await self._ensure_voice_chat(m.chat.id)
             # Prime a real discovery queue: curated anchors + live YouTube search results.
             added=await self._autofill(m.chat.id,minimum=12)
             if not p.current:
-                await self._ensure_voice_chat(m.chat.id)
-                await self.play_next(m.chat.id)
+                started=await self.play_next(m.chat.id)
+                if not started:
+                    raise RuntimeError("Autoplay discovered tracks, but none could be started in the Voice Chat.")
             await m.reply_text(
                 f"♾️ <b>AUTOPLAY ∞ DISCOVERY</b>\n"
                 f"🎯 Topic: <code>{arg[:120]}</code>\n"
@@ -1238,9 +1150,7 @@ class PrimeBeats:
             topic=arg or ({"trending":"trending songs","top":"top songs","charts":"music charts","mix":"best music mix","nonstop":"nonstop music"}.get(cmd,"music"))
             p=self.store.get(m.chat.id); p.autoplay=True; p.autoplay_topic=topic[:120]
             added=await self._autofill(m.chat.id,minimum=12)
-            if not p.current:
-                await self._ensure_voice_chat(m.chat.id)
-                await self.play_next(m.chat.id)
+            if not p.current: await self.play_next(m.chat.id)
             await m.reply_text(f"📡 <b>{cmd.upper()} DISCOVERY ONLINE</b>\n\n🎯 <code>{topic[:120]}</code>\n📥 Fresh tracks: <code>{added}</code>\n♾ <code>CONTINUOUS</code>",reply_markup=player_keyboard())
 
         @self.bot.on_message(filters.command("stats"))
@@ -1257,7 +1167,7 @@ class PrimeBeats:
                 ms=(time.perf_counter()-t)*1000
                 sec=int(time.monotonic()-self.started); days,rem=divmod(sec,86400); mins=rem//60
                 root=os.path.dirname(__file__)
-                image=os.environ.get("PING_IMAGE_PATH",os.path.join(root,"assets","fearless_ping.jpg"))
+                image=asset("fearless_ping.jpg", "PING_IMAGE_PATH")
                 caption=(
                     f"🏓 <b>ᴩᴏɴɢ : {ms:.0f} ms</b>\n\n"
                     f"˹⚝ <b>𝐅ᴇᴀʀʟᴇss ꭗ 𝐌ᴜsɪᴄ ᯤ</b>˼ ♪ <b>sʏsᴛᴇᴍ sᴛᴀᴛs :</b>\n\n"
@@ -1268,20 +1178,12 @@ class PrimeBeats:
                     f"🔮 ᴅɪsᴋ : <b>{disk:.1f}%</b>\n"
                     f"☁️ ᴩʏ-ᴛɢᴄᴀʟʟs : <b>{tg:.0f} ms</b>"
                 )
-                file_id=os.environ.get("PING_IMAGE_FILE_ID","").strip()
-                try:
-                    if file_id or os.path.isfile(image):
-                        await self.bot.send_photo(
-                            m.chat.id,file_id or image,caption=caption
-                        )
-                        with suppress(Exception):
-                            await x.delete()
-                    else:
-                        await x.edit_text(caption)
-                except Exception:
-                    log.exception("PING IMAGE SEND FAILED path=%s",image)
-                    with suppress(Exception):
-                        await x.edit_text(caption)
+                with suppress(Exception): await x.delete()
+                file_id=os.environ.get("PING_IMAGE_FILE_ID", "").strip()
+                if os.path.isfile(image) or file_id:
+                    await self.bot.send_photo(m.chat.id,file_id or image,caption=caption)
+                else:
+                    await m.reply_text(caption)
             except Exception:
                 log.exception("PING FAILED")
                 await m.reply_text("🏓 <b>ᴩᴏɴɢ : online</b>")

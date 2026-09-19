@@ -62,6 +62,18 @@ def links(cfg):
          InlineKeyboardButton("◀️ Main Menu",callback_data="help")]
     ])
 
+def start_keyboard(cfg):
+    """Private /start keyboard matching the FEARLESS X MUSIC welcome layout."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("◇+ INTEGRATE IN YOUR CHAT +◇", callback_data="links")],
+        [InlineKeyboardButton("♫+ HELP & COMMAND GUIDE +♫", callback_data="help")],
+        [
+            InlineKeyboardButton("SUPPORT ☎", url="https://t.me/SPARK_X_NETWORK"),
+            InlineKeyboardButton("UPDATES ▣", url="https://t.me/SPARK_X_NETWORK_OP"),
+        ],
+        [InlineKeyboardButton("HOW TO CLONE ⟳", callback_data="clone_help")],
+    ])
+
 def home_keyboard(cfg):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎧 PLAY",callback_data="help:play"),
@@ -126,22 +138,19 @@ def effects_keyboard(page=0):
 def welcome(cfg,user):
     name=esc(user or "there")
     return (
-        f"{_top('PRIME × BEATS • MUSIC','⚝')}\n\n"
-        f"<b>⚡ {esc(cfg.bot_name)}</b>\n"
-        f"👤 Welcome, <b>{name}</b>\n\n"
-        "<b>┌─ ENGINE STATUS</b>\n"
-        "│ 🟢 Audio engine online\n"
-        "│ 🔵 Video engine • SD 480p output\n"
-        "│ 🟣 Smart queue + autoplay\n"
-        f"│ 🟡 {len(EFFECTS)}+ audio effects\n"
-        "<b>└────────────────</b>\n\n"
-        "<b>🚀 QUICK START</b>\n"
-        "<code>/play O Maahi</code>\n"
-        "<code>/vplay music video</code>\n"
-        "<code>/search song name</code>\n"
-        "<code>/autoplay Romantic Hindi Songs</code>\n"
-        "<code>/yourdaddy</code>\n\n"
-        f"<blockquote>{OWNER}\n🛡 Group playback requires owner approval.</blockquote>"
+        "<b>╭─ SALUTATIONS 👋 ─╮</b>\n"
+        "<b>⚝ FEARLESS × MUSIC ᯤ</b>\n"
+        "<b>╰──────────────────╯</b>\n\n"
+        f"<b>✦ WELCOME TO ⚝ FEARLESS × MUSIC —</b>\n"
+        f"<b>👤 {name}</b>\n\n"
+        "<b>✦ FAST, FEATURE-RICH TELEGRAM MUSIC BOT</b>\n"
+        "<b>✦ STREAMS MUSIC SMOOTHLY WITH LOW LATENCY</b>\n"
+        "<b>✦ RUNS ON AN OPTIMIZED MULTI-SOURCE ENGINE FOR FAST PLAYBACK</b>\n"
+        "<b>✦ CRYSTAL CLEAR AUDIO QUALITY WITH FULL CONTROL</b>\n"
+        "<b>────────────────────────────────</b>\n"
+        "<b>✦ TAP HELP BELOW TO EXPLORE EVERY COMMAND THIS BOT HAS TO OFFER</b>\n\n"
+        "<blockquote>👑 <b>@Prime_Fearless_45</b>\n"
+        "🛡 <b>Group playback requires owner approval.</b></blockquote>"
     )
 
 def progress_bar(p,width=12):
